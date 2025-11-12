@@ -38,33 +38,27 @@ uint64
 usertrap(void)
 {
   int which_dev = 0;
-
   if((r_sstatus() & SSTATUS_SPP) != 0)
     panic("usertrap: not from user mode");
 
   // send interrupts and exceptions to kerneltrap(),
   // since we're now in the kernel.
   w_stvec((uint64)kernelvec);  //DOC: kernelvec
-
   struct proc *p = myproc();
-  
+
   // save user program counter.
   p->trapframe->epc = r_sepc();
-  
+
   if(r_scause() == 8){
     // system call
-
     if(killed(p))
       kexit(-1);
-
     // sepc points to the ecall instruction,
     // but we want to return to the next instruction.
     p->trapframe->epc += 4;
-
     // an interrupt will change sepc, scause, and sstatus,
     // so enable only now that we're done with those registers.
     intr_on();
-
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
@@ -76,40 +70,26 @@ usertrap(void)
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
     setkilled(p);
   }
-
   if(killed(p))
     kexit(-1);
-
-  if(which_dev == 2) {
-    if(p->state == RUNNING) {
-        p->remaining_ticks--; // Decrement the remaining time slice
-
-        if (p->remaining_ticks <= 0) {
-            // Time slice expired: demote if not already in the lowest queue
-            if (p->q_level < MAX_QUEUES - 1) {
-                p->q_level++; // Demote to next queue (Q0->Q1->Q2)
-            }
-            
-            // Reset the time slice based on the new queue
-            if (p->q_level == 0) p->remaining_ticks = TSLICE_Q0;
-            else if (p->q_level == 1) p->remaining_ticks = TSLICE_Q1;
-            else if (p->q_level == 2) p->remaining_ticks = TSLICE_Q2;
-
-            // Force a context switch (yield)
-            yield();
-        } else {
-            // Quantum not depleted, but yield to allow scheduler to check 
-            // for higher priority tasks (I/O, promoted, or simply fairness)
-            yield(); 
-        }
+  // give up the CPU if this is a timer interrupt.
+  if(which_dev == 2){
+    // *** ADD THIS DEMOTION LOGIC ***
+    // This process was PREEMPTED. Check if it used its full slice.
+    acquire(&p->lock);
+    if(p->remaining_ticks <= 0){
+      if(p->queue_level < 2){
+        p->queue_level++; // Demote
+      }
     }
+    release(&p->lock);
+    // *** END OF NEW LOGIC ***
+    
+    yield(); // Now yield, as before
   }
-
   prepare_return();
-
   // the user page table to switch to, for trampoline.S
   uint64 satp = MAKE_SATP(p->pagetable);
-
   // return to trampoline.S; satp value in a0.
   return satp;
 }
@@ -182,9 +162,10 @@ kerneltrap()
   w_sstatus(sstatus);
 }
 
-void
+void //changed
 clockintr()
 {
+  // increment global ticks (only on cpu 0, like original xv6)
   if(cpuid() == 0){
     acquire(&tickslock);
     ticks++;
@@ -192,11 +173,21 @@ clockintr()
     release(&tickslock);
   }
 
-  // ask for the next timer interrupt. this also clears
-  // the interrupt request. 1000000 is about a tenth
-  // of a second.
+  // Update running process quantum safely (hold p->lock while modifying)
+  struct proc *p = myproc();
+  if(p){
+    acquire(&p->lock);
+    if(p->state == RUNNING){
+      p->remaining_ticks--; // <-- ONLY DECREMENT. DO NOT DEMOTE.
+    }
+    release(&p->lock);
+  }
+
+  // schedule the next timer interrupt
   w_stimecmp(r_time() + 1000000);
 }
+
+
 
 // check if it's an external interrupt or software interrupt,
 // and handle it.
