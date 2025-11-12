@@ -6,6 +6,10 @@
 #include "proc.h"
 #include "defs.h"
 
+//added
+extern uint ticks;  // global timer tick counter from trap.c
+
+
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -19,9 +23,6 @@ extern void forkret(void);
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
-
-//added
-uint next_promotion_tick = PROMOTION_INTERVAL;
 
 // helps ensure that wakeups of wait()ing
 // parents are not lost. helps obey the
@@ -128,8 +129,9 @@ found:
   p->pid = allocpid();
   p->state = USED;
   //added
-  p->q_level = 0;
-  p->remaining_ticks = TSLICE_Q0;
+  p->queue_level = 0;
+  p->remaining_ticks = MLFQ_Q0_TICKS;
+  p->last_promote = ticks;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -430,77 +432,73 @@ kwait(uint64 addr)
 void //changed
 scheduler(void)
 {
-  struct proc *p;
   struct cpu *c = mycpu();
-
   c->proc = 0;
+
   for(;;){
     intr_on();
-    intr_off();
 
-    // 1. MLFQ Starvation Prevention: Promote processes every 100 ticks
-    // This check uses the global 'ticks' from trap.c
-    acquire(&tickslock);
-    if (ticks >= next_promotion_tick) {
-        release(&tickslock); // Release the tickslock before acquiring proc locks
-        
-        for(p = proc; p < &proc[NPROC]; p++) {
-            acquire(&p->lock);
-            // Only promote if process is active and below Q0
-            if (p->q_level > 0 && p->state != UNUSED && p->state != ZOMBIE) {
-                p->q_level = 0;             // Promote to Q0
-                p->remaining_ticks = TSLICE_Q0; // Reset time slice
-            }
-            release(&p->lock);
-        }
-        
-        // Update the next promotion time (reacquire tickslock for safety if needed,
-        // but since we are not changing `ticks`, we can update the promotion state safely)
-        
-        // Re-acquire tickslock to update next_promotion_tick safely based on current ticks value, 
-        // as ticks is constantly changing.
-        acquire(&tickslock);
-        next_promotion_tick = (ticks / PROMOTION_INTERVAL + 1) * PROMOTION_INTERVAL;
-        release(&tickslock);
-
-    } else {
-        release(&tickslock);
-    }
-    
-    // 2. MLFQ Priority Scheduling (Iterate Q0, then Q1, then Q2)
+    struct proc *p = 0;
     int found = 0;
-    for (int q = 0; q < MAX_QUEUES; q++) {
-        for(p = proc; p < &proc[NPROC]; p++) {
-            acquire(&p->lock);
-            // Check if process is RUNNABLE and belongs to the current queue 'q'
-            if(p->state == RUNNABLE && p->q_level == q) {
-                // Found a highest priority RUNNABLE process.
-                p->state = RUNNING;
-                c->proc = p;
-                
-                // Switch to chosen process.
-                swtch(&c->context, &p->context);
 
-                // Process is done running for now.
-                c->proc = 0;
-                found = 1;
-                release(&p->lock);
-                goto end_scheduling; // Jump out of all loops to the wfi check
-            }
-            release(&p->lock);
+    acquire(&tickslock);
+    uint cur_ticks = ticks;
+    release(&tickslock);
+
+    // Periodic promotion check
+    static uint last_global_promo = 0;
+    if(cur_ticks - last_global_promo >= MLFQ_PROMOTE_INTERVAL){
+      last_global_promo = cur_ticks;
+      for(struct proc *pp = proc; pp < &proc[NPROC]; pp++){
+        acquire(&pp->lock);
+        if(pp->state == RUNNABLE || pp->state == RUNNING || pp->state == SLEEPING){
+          if(pp->queue_level > 0){
+            pp->queue_level = 0;
+            pp->remaining_ticks = MLFQ_Q0_TICKS;
+            pp->last_promote = cur_ticks;
+            // optional debug:
+            // printf("[PROMOTE] pid=%d -> Q0\n", pp->pid);
+          }
         }
-        // If we found a process in queue 'q', we should stop searching lower queues
-        if (found) break; 
+        release(&pp->lock);
+      }
     }
 
-    end_scheduling:;
+    // pick highest-priority runnable process
+    for(int level = 0; level < 3 && !found; level++){
+      for(p = proc; p < &proc[NPROC]; p++){
+        acquire(&p->lock);
+        if(p->state == RUNNABLE && p->queue_level == level){
+          found = 1;
+          break;
+        }
+        release(&p->lock);
+      }
+    }
 
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
+if(found){
+      p->state = RUNNING;
+      c->proc = p;
+
+      if(p->remaining_ticks <= 0){
+        if(p->queue_level == 0)
+          p->remaining_ticks = MLFQ_Q0_TICKS;
+        else if(p->queue_level == 1)
+          p->remaining_ticks = MLFQ_Q1_TICKS;
+        else
+          p->remaining_ticks = MLFQ_Q2_TICKS;
+      }
+      
+      swtch(&c->context, &p->context);
+      c->proc = 0;
+      release(&p->lock);
+    }
+    else {
       asm volatile("wfi");
     }
   }
 }
+
 
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores
